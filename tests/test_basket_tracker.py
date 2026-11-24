@@ -22,4 +22,4 @@ def test_tracker_on_sample_image():
     assert isinstance(summary["basket_summary"], dict)
 
     tracker.reset_basket()
-    assert tracker.basket_counts == {}
+    assert tracker.basket.get_summary()["basket_summary"] == {}

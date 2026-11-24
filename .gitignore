@@ -227,3 +227,6 @@ outputs/
 __pycache__/
 *.pyc
 runs/
+
+# Local backup files
+*.bak
