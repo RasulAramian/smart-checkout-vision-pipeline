@@ -1,8 +1,11 @@
 from pathlib import Path
+from unittest.mock import patch
+import asyncio
+import threading
 
 from fastapi.testclient import TestClient
 
-from app import app
+from app import app, session_manager
 
 
 client = TestClient(app)
@@ -131,6 +134,55 @@ def test_delete_session():
     assert response.status_code == 404
 
 
+def test_delete_unknown_session():
+    response = client.delete(
+        "/sessions/unknown-session-id"
+    )
+
+    assert response.status_code == 404
+
+
+def test_delete_session_while_in_use_returns_409():
+    session_id = create_session()
+
+    with session_manager.use_session(session_id):
+        response = client.delete(
+            f"/sessions/{session_id}"
+        )
+
+        assert response.status_code == 409
+
+    response = client.get(
+        f"/sessions/{session_id}/basket"
+    )
+
+    assert response.status_code == 200
+
+
+def test_expired_session_returns_404():
+    session_id = create_session()
+
+    session = session_manager.get_session(session_id)
+
+    assert session is not None
+
+    expired_time = (
+        session.last_activity
+        + session_manager.idle_timeout_seconds
+        + 1
+    )
+
+    with patch(
+        "src.session_manager.monotonic",
+        return_value=expired_time,
+    ):
+        response = client.get(
+            f"/sessions/{session_id}/basket"
+        )
+
+    assert response.status_code == 404
+
+
 def test_unknown_session_returns_404():
     response = client.get(
         "/sessions/unknown-session-id/basket"
@@ -150,3 +202,27 @@ def test_health_check():
     assert data["model_loaded"] is True
     assert data["classes_count"] > 0
     assert data["active_sessions"] >= 0
+
+def test_lifespan_starts_and_stops_cleanup_task(monkeypatch):
+    """Verify that the cleanup task starts and stops with the API."""
+
+    started = threading.Event()
+    stopped = threading.Event()
+
+    async def fake_periodic_cleanup():
+        started.set()
+
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(
+        "app._periodic_session_cleanup",
+        fake_periodic_cleanup,
+    )
+
+    with TestClient(app):
+        assert started.wait(timeout=2)
+
+    assert stopped.wait(timeout=2)
