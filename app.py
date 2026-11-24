@@ -9,21 +9,25 @@ import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
-from src.basket_tracker import SmartBasketTracker
+from src.basket_tracker import SharedYOLODetector
+from src.session_manager import SessionManager
 
 
 MODEL_PATH = Path("models/best.pt")
 
+
 app = FastAPI(
     title="AKNA Smart Checkout Vision API",
     description=(
-        "Real-time product detection and ByteTrack basket tracking "
-        "with YOLOv8 and OpenCV."
+        "Real-time product detection and session-based "
+        "ByteTrack basket tracking with YOLOv8 and OpenCV."
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
 
-tracker = SmartBasketTracker(model_path=MODEL_PATH)
+
+detector = SharedYOLODetector(model_path=MODEL_PATH)
+session_manager = SessionManager(detector=detector)
 
 
 def _decode_image(image_bytes: bytes) -> np.ndarray:
@@ -48,6 +52,20 @@ def _decode_image(image_bytes: bytes) -> np.ndarray:
     return frame
 
 
+def _get_session(session_id: str):
+    """Retrieve a session or raise a 404 error."""
+
+    session = session_manager.get_session(session_id)
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found.",
+        )
+
+    return session
+
+
 @app.get("/health")
 def health_check() -> dict[str, Any]:
     """Return API and model health information."""
@@ -55,51 +73,97 @@ def health_check() -> dict[str, Any]:
     return {
         "status": "ok",
         "model_loaded": MODEL_PATH.exists(),
-        "classes_count": len(tracker.model.names),
+        "classes_count": len(detector.model.names),
+        "active_sessions": session_manager.get_active_sessions_count(),
     }
 
 
-@app.get("/basket")
-def get_basket_state() -> dict[str, Any]:
-    """Return the current basket summary."""
+@app.post("/sessions")
+def create_session() -> dict[str, str]:
+    """Create a new checkout session."""
 
-    basket_summary = tracker.basket.get_summary()
+    session_id = session_manager.create_session()
 
     return {
+        "session_id": session_id,
+        "status": "created",
+    }
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str) -> dict[str, str]:
+    """Delete an existing checkout session."""
+
+    deleted = session_manager.delete_session(session_id)
+
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found.",
+        )
+
+    return {
+        "session_id": session_id,
+        "status": "deleted",
+    }
+
+
+@app.get("/sessions/{session_id}/basket")
+def get_basket_state(session_id: str) -> dict[str, Any]:
+    """Return the basket summary for one session."""
+
+    session = _get_session(session_id)
+
+    with session.lock:
+        basket_summary = session.tracker.basket.get_summary()
+
+    return {
+        "session_id": session_id,
         "total_unique_tracked_items": basket_summary["total_items"],
         "basket_summary": basket_summary["basket_summary"],
     }
 
 
-@app.post("/basket/reset")
-def reset_basket_state() -> dict[str, str]:
-    """Reset the current basket."""
+@app.post("/sessions/{session_id}/basket/reset")
+def reset_basket_state(session_id: str) -> dict[str, str]:
+    """Reset the basket and tracking state for one session."""
 
-    tracker.reset_basket()
+    session = _get_session(session_id)
+
+    with session.lock:
+        session.tracker.reset_basket()
 
     return {
+        "session_id": session_id,
         "status": "basket reset successfully",
     }
 
 
-@app.post("/detect-frame")
+@app.post("/sessions/{session_id}/detect-frame")
 async def detect_frame(
+    session_id: str,
     file: UploadFile = File(...),
     return_image: bool = False,
 ) -> JSONResponse:
-    """Detect and track products in an uploaded image."""
+    """Detect and track products within one checkout session."""
+
+    session = _get_session(session_id)
 
     content = await file.read()
 
     frame = _decode_image(content)
 
-    annotated_frame, summary = tracker.process_frame(
-        frame=frame,
-        persist=True,
-        draw=True,
-    )
+    with session.lock:
+        annotated_frame, summary = session.tracker.process_frame(
+            frame=frame,
+            persist=True,
+            draw=True,
+        )
 
-    payload: dict[str, Any] = dict(summary)
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        **summary,
+    }
 
     if return_image:
         success, encoded = cv2.imencode(".jpg", annotated_frame)
